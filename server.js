@@ -1,10 +1,13 @@
-// server.js - Main Express application
+// server.js - Main Express application optimized for Vercel serverless
 const express = require('express');
-const puppeteer = require('puppeteer');
 const cors = require('cors');
 const path = require('path');
 const ExcelJS = require('exceljs');
 const { Parser } = require('json2csv');
+
+// Import chrome-aws-lambda and puppeteer-core for Vercel compatibility
+const chromium = require('chrome-aws-lambda');
+const puppeteerCore = require('puppeteer-core');
 
 const app = express();
 const PORT = process.env.PORT || 2000;
@@ -78,35 +81,38 @@ const randomDelay = async (page, min = 1000, max = 4000) => {
 };
 
 // Main scraping function with improved robustness and error handling
+// Modified to use chrome-aws-lambda for Vercel compatibility
 async function scrapeGoogleMaps(searchQuery, limit) {
-  const browser = await puppeteer.launch({
-    headless: 'true',  // Change to false for debugging
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--disable-gpu',
-      '--window-size=1920,1080',
-    ]
-  });
-  
-  const page = await browser.newPage();
-  
-  // Set a realistic user agent
-  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.67 Safari/537.36');
-  
-  // Add extra headers to look more like a real browser
-  await page.setExtraHTTPHeaders({
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-    'Referer': 'https://www.google.com/'
-  });
+  let browser = null;
   
   try {
+    console.log(`Starting Google Maps scraping for: ${searchQuery}`);
+    
+    // Launch browser using chrome-aws-lambda for Vercel serverless compatibility
+    browser = await puppeteerCore.launch({
+      args: chromium.args,
+      defaultViewport: chromium.defaultViewport,
+      executablePath: await chromium.executablePath,
+      headless: chromium.headless,
+      ignoreHTTPSErrors: true,
+    });
+    
+    // Create a new page for the initial search
+    const searchPage = await browser.newPage();
+    
+    // Set a realistic user agent
+    await searchPage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.67 Safari/537.36');
+    
+    // Add extra headers to look more like a real browser
+    await searchPage.setExtraHTTPHeaders({
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+      'Referer': 'https://www.google.com/'
+    });
+    
     // Enable request interception for better performance
-    await page.setRequestInterception(true);
-    page.on('request', (req) => {
+    await searchPage.setRequestInterception(true);
+    searchPage.on('request', (req) => {
       // Skip loading images, fonts and stylesheets for better performance
       const resourceType = req.resourceType();
       if (['image', 'font', 'stylesheet', 'media'].includes(resourceType)) {
@@ -117,244 +123,81 @@ async function scrapeGoogleMaps(searchQuery, limit) {
     });
 
     console.log(`Navigating to Google Maps and searching for: ${searchQuery}`);
-    await page.goto('https://www.google.com/maps', { waitUntil: 'networkidle2', timeout: 60000 });
-    
-    // Accept cookies if the dialog appears
-    try {
-      const cookieSelectors = [
-        'button[aria-label="Accept all"]',
-        'button[jsname="higCR"]',
-        'button:has-text("Accept all")',
-        'button:has-text("I agree")'
-      ];
-      
-      for (const selector of cookieSelectors) {
-        const cookieButton = await page.$(selector);
-        if (cookieButton) {
-          await cookieButton.click();
-          console.log('Accepted cookies');
-          await page.waitForTimeout(2000);
-          break;
-        }
-      }
-    } catch (error) {
-      console.log('No cookie consent dialog found or error handling it:', error.message);
-    }
+    await searchPage.goto('https://www.google.com/maps', { waitUntil: 'networkidle2', timeout: 60000 });
     
     // Find and type in the search box
-    await page.waitForSelector('#searchboxinput', { timeout: 15000 });
-    await page.type('#searchboxinput', searchQuery);
+    await searchPage.waitForSelector('#searchboxinput', { timeout: 15000 });
+    await searchPage.type('#searchboxinput', searchQuery);
     
     // Add a small delay between typing and pressing Enter to mimic human behavior
-    await randomDelay(page, 800, 2000);
+    await randomDelay(searchPage, 800, 2000);
     
-    await page.keyboard.press('Enter');
+    await searchPage.keyboard.press('Enter');
     
-    // Wait longer for search results to load completely
+    // Wait for search results to load completely
     console.log('Waiting for search results to load...');
-    await page.waitForTimeout(8000);
+    await searchPage.waitForTimeout(8000);
     
-    // Try different selectors for search results container
-    const feedSelectors = [
-      'div[role="feed"]',
-      'div[role="main"] div.m6QErb',
-      'div.m6QErb[role="region"]',
-      'div.ecceSd',
-      'div.section-result-content'
-    ];
-    
-    let feedSelector = null;
-    for (const selector of feedSelectors) {
-      const feed = await page.$(selector);
-      if (feed) {
-        feedSelector = selector;
-        console.log(`Found search results with selector: ${selector}`);
-        break;
-      }
-    }
-    
-    if (!feedSelector) {
-      console.log('Could not find search results container with known selectors');
-      console.log('Taking a screenshot for debugging...');
-      await page.screenshot({ path: 'search-results-debug.png' });
-    }
-    
-    // Scroll to load more results until we have the required number of listings
+    // Scroll to load more results until we have the required number of listings URLs
     console.log(`Scrolling to load at least ${limit} results...`);
     
-    // Get the initial count of listings
-    let listingsCount = await getListingsCount(page);
-    console.log(`Initial listings count: ${listingsCount}`);
+    // Get listing URLs with names from search results
+    const listingUrls = await collectListingUrls(searchPage, limit);
+    console.log(`Collected ${listingUrls.length} business listing URLs`);
     
-    // Keep scrolling until we have enough listings or can't load more
-    let previousCount = 0;
-    let scrollAttempts = 0;
-    const maxScrollAttempts = 20; // Prevent infinite scrolling
-    
-    while (listingsCount < limit && scrollAttempts < maxScrollAttempts && listingsCount !== previousCount) {
-      previousCount = listingsCount;
-      await autoScroll(page);
-      listingsCount = await getListingsCount(page);
-      console.log(`After scrolling: ${listingsCount} listings found`);
-      scrollAttempts++;
-    }
-    
-    // Collect basic listing information
-    console.log('Collecting basic listing information...');
-    const businessListings = await collectListings(page, limit);
-    console.log(`Collected ${businessListings.length} listings`);
-    
-    // For each listing, collect detailed info
+    // Now visit each URL and scrape the details
     const detailedData = [];
     
-    for (let i = 0; i < businessListings.length; i++) {
+    for (let i = 0; i < listingUrls.length; i++) {
       try {
-        const listing = businessListings[i];
-        console.log(`Processing business ${i+1}/${businessListings.length}: ${listing.name}`);
+        const { name, url } = listingUrls[i];
+        console.log(`Processing business ${i+1}/${listingUrls.length}: ${name}`);
         
-        // Always start from the search results page for each listing
-        if (i > 0) {
-          console.log('Navigating back to search results...');
-          await page.goto(`https://www.google.com/maps/search/${encodeURIComponent(searchQuery)}`, { 
-            waitUntil: 'networkidle2',
-            timeout: 60000 
-          });
-          
-          // Wait longer to ensure page loads completely
-          await page.waitForTimeout(8000);
-          
-          // Need to scroll to find our place if it's further down
-          const scrollsNeeded = Math.floor(i / 3);
-          console.log(`Scrolling ${scrollsNeeded} times to reach listing #${i}`);
-          
-          for (let j = 0; j < scrollsNeeded; j++) {
-            await autoScroll(page);
-            await page.waitForTimeout(2000);
+        // Create a new page for each listing
+        const detailPage = await browser.newPage();
+        
+        // Configure the detail page
+        await detailPage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.67 Safari/537.36');
+        await detailPage.setExtraHTTPHeaders({
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+          'Referer': 'https://www.google.com/maps'
+        });
+        
+        // Enable request interception
+        await detailPage.setRequestInterception(true);
+        detailPage.on('request', (req) => {
+          const resourceType = req.resourceType();
+          if (['image', 'font', 'stylesheet', 'media'].includes(resourceType)) {
+            req.abort();
+          } else {
+            req.continue();
           }
-        }
+        });
         
-        // Multiple strategies to click on a listing
-        let clickSuccess = false;
-        
-        // Strategy 1: Try clicking using various selectors
-        const listingSelectors = [
-          `a.hfpxzc[aria-label="${listing.name.replace(/"/g, '\\"')}"]`,
-          `a[aria-label="${listing.name.replace(/"/g, '\\"')}"]`,
-          `div[aria-label="${listing.name.replace(/"/g, '\\"')}"]`,
-          `div.V0h1Ob-haAclf[aria-label="${listing.name.replace(/"/g, '\\"')}"]`,
-          `div.Nv2PK[aria-label="${listing.name.replace(/"/g, '\\"')}"]`
-        ];
-        
-        for (const selector of listingSelectors) {
-          try {
-            console.log(`Trying to click using selector: ${selector}`);
-            const listingElement = await page.$(selector);
-            if (listingElement) {
-              await listingElement.click();
-              console.log(`Successfully clicked listing using selector`);
-              clickSuccess = true;
-              break;
-            }
-          } catch (err) {
-            console.log(`Error clicking with selector: ${err.message}`);
-          }
-        }
-        
-        // Strategy 2: Click by index if selectors failed
-        if (!clickSuccess) {
-          try {
-            console.log(`Trying to click listing #${i} by index...`);
-            // Try different listing item selectors
-            const itemSelectors = [
-              'a.hfpxzc',
-              'div.Nv2PK',
-              'div.V0h1Ob-haAclf',
-              'div[role="article"]',
-              'a[jsaction*="click"]'
-            ];
-            
-            for (const selector of itemSelectors) {
-              clickSuccess = await page.evaluate((selector, index) => {
-                const items = document.querySelectorAll(selector);
-                console.log(`Found ${items.length} items with selector ${selector}`);
-                if (items && items[index]) {
-                  items[index].click();
-                  return true;
-                }
-                return false;
-              }, selector, i);
-              
-              if (clickSuccess) {
-                console.log(`Successfully clicked listing #${i} with selector ${selector}`);
-                break;
-              }
-            }
-          } catch (err) {
-            console.log(`Error clicking by index: ${err.message}`);
-          }
-        }
-        
-        // Strategy 3: Try JavaScript click by searching text content
-        if (!clickSuccess) {
-          try {
-            console.log('Trying to click by text content match...');
-            // This strategy searches for any element containing the business name text
-            clickSuccess = await page.evaluate((businessName) => {
-              // Get all elements
-              const allElements = document.querySelectorAll('*');
-              
-              // Find one containing our business name
-              for (const element of allElements) {
-                if (element.textContent && element.textContent.includes(businessName)) {
-                  // Find the closest clickable parent
-                  let current = element;
-                  while (current && current !== document.body) {
-                    if (current.tagName === 'A' || current.onclick || current.getAttribute('role') === 'button') {
-                      current.click();
-                      return true;
-                    }
-                    current = current.parentElement;
-                  }
-                  // If no clickable parent, try clicking the element itself
-                  element.click();
-                  return true;
-                }
-              }
-              return false;
-            }, listing.name);
-            
-            if (clickSuccess) {
-              console.log('Successfully clicked listing by text content match');
-            }
-          } catch (err) {
-            console.log(`Error with text content match click: ${err.message}`);
-          }
-        }
-        
-        if (!clickSuccess) {
-          console.log(`Could not click on listing ${i}, skipping...`);
-          continue;
-        }
+        // Navigate to listing URL
+        console.log(`Navigating to URL: ${url}`);
+        await detailPage.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
         
         // Wait for details panel to load
         console.log('Waiting for business details to load...');
-        await page.waitForTimeout(8000); // Extended wait time
-        
-        // Take a screenshot for debugging if needed
-        // await page.screenshot({ path: `business-${i}.png` });
+        await detailPage.waitForTimeout(8000);
         
         // Extract detailed info
         console.log('Extracting detailed business information...');
-        const detailedInfo = await extractBusinessDetails(page);
+        const detailedInfo = await extractBusinessDetails(detailPage);
         
         // Combine basic and detailed info
         detailedData.push({
-          ...listing,
+          name,
           ...detailedInfo
         });
         
+        // Close the detail page to free up resources
+        await detailPage.close();
+        
         // Add some delay between businesses
-        await randomDelay(page, 2000, 5000);
+        await randomDelay(searchPage, 2000, 5000);
         
       } catch (error) {
         console.error(`Error processing business ${i+1}:`, error.message);
@@ -368,93 +211,167 @@ async function scrapeGoogleMaps(searchQuery, limit) {
     console.error('Error during scraping:', error);
     throw error;
   } finally {
-    await browser.close();
+    if (browser !== null) {
+      await browser.close();
+    }
   }
 }
 
-// Function to get the number of listings currently loaded with multiple selector attempts
-async function getListingsCount(page) {
-  return await page.evaluate(() => {
-    const selectors = [
-      'a.hfpxzc',
-      'div.Nv2PK',
-      'div.V0h1Ob-haAclf',
-      'div[role="article"]',
-      'a[jsaction*="click"]'
-    ];
+// Improved function to collect all listing URLs from search results
+async function collectListingUrls(page, limit) {
+  const listingUrls = [];
+  let previousUrlCount = 0;
+  let scrollAttempts = 0;
+  const maxScrollAttempts = 30; // Increased max scroll attempts
+  let consecutiveNoNewUrls = 0;
+  const maxConsecutiveNoNewUrls = 5; // Stop after 5 consecutive scrolls with no new URLs
+  
+  while (listingUrls.length < limit && scrollAttempts < maxScrollAttempts && 
+         consecutiveNoNewUrls < maxConsecutiveNoNewUrls) {
     
-    for (const selector of selectors) {
-      const items = document.querySelectorAll(selector);
-      if (items && items.length > 0) {
-        return items.length;
+    previousUrlCount = listingUrls.length;
+    
+    // Wait for a moment to ensure all elements have loaded
+    await page.waitForTimeout(2000);
+    
+    // Extract URLs currently visible
+    const newUrls = await page.evaluate(() => {
+      const results = [];
+      // Get all listing links - checking multiple selectors for better reliability
+      const listingLinkSelectors = [
+        'a.hfpxzc', 
+        '.Nv2PK a[href*="/maps/place/"]',
+        'div[role="article"] a[data-value]',
+        'a[jsaction*="mouseup"]',
+        'a[aria-label][href*="/maps/place/"]'
+      ];
+      
+      let listingLinks = [];
+      for (const selector of listingLinkSelectors) {
+        const elements = document.querySelectorAll(selector);
+        if (elements.length > 0) {
+          listingLinks = elements;
+          break;
+        }
+      }
+      
+      listingLinks.forEach(link => {
+        const url = link.href;
+        
+        // Try to extract name from different attributes
+        let name = link.getAttribute('aria-label');
+        
+        if (!name) {
+          // Try to find name in nearby elements
+          const nearbyHeading = link.closest('div').querySelector('div[role="heading"], h3, h2, h1');
+          if (nearbyHeading) {
+            name = nearbyHeading.textContent.trim();
+          } else {
+            // Use some content from the link or its parent
+            name = (link.textContent || link.closest('div').textContent || '').trim();
+            // Limit to first line if multiple lines
+            name = name.split('\n')[0].trim();
+          }
+        }
+        
+        // Only add if we have both URL and name
+        if (url && name && url.includes('/maps/place/')) {
+          results.push({ name, url });
+        }
+      });
+      
+      return results;
+    });
+    
+    // Add new unique URLs to our collection
+    let addedNewUrls = false;
+    for (const item of newUrls) {
+      // Check if URL already exists in listingUrls array
+      if (!listingUrls.some(existing => existing.url === item.url)) {
+        listingUrls.push(item);
+        addedNewUrls = true;
+        if (listingUrls.length >= limit) break;
       }
     }
-    return 0;
-  });
+    
+    console.log(`Found ${listingUrls.length}/${limit} URLs after scroll #${scrollAttempts + 1}`);
+    
+    // Track if we found new URLs
+    if (addedNewUrls) {
+      consecutiveNoNewUrls = 0;
+    } else {
+      consecutiveNoNewUrls++;
+      console.log(`No new URLs found for ${consecutiveNoNewUrls} consecutive scrolls`);
+    }
+    
+    // Scroll to load more results if needed
+    if (listingUrls.length < limit) {
+      await improvedAutoScroll(page);
+      scrollAttempts++;
+      
+      // Wait longer after each scroll to ensure results load
+      const waitTime = 3000 + (scrollAttempts * 500); // Gradually increase wait time
+      await page.waitForTimeout(waitTime);
+    }
+  }
+  
+  // Return only up to the limit requested
+  return listingUrls.slice(0, limit);
 }
 
-// Function to collect basic information about each listing with improved selectors
-async function collectListings(page, limit) {
-  return await page.evaluate((maxResults) => {
-    const listings = [];
-    const selectors = [
-      'a.hfpxzc',
-      'div.Nv2PK',
-      'div.V0h1Ob-haAclf',
-      'div[role="article"]',
-      'a[jsaction*="click"]'
+// Improved auto scroll function with better detection of scrollable elements
+async function improvedAutoScroll(page) {
+  return await page.evaluate(async () => {
+    // Try different selectors for the scrollable container
+    const scrollableSelectors = [
+      'div[role="feed"]',
+      'div.m6QErb[role="region"]',
+      'div.m6QErb',
+      'div.section-scrollbox',
+      'div.ecceSd',
+      '.m6QErb-tempH0gTDc',
+      '.DxyBCb',
+      '.kA9KIf',
+      '[aria-label="Results for"]',
+      'div[jsaction*="scroll"]'
     ];
     
-    let items = [];
+    let scrollableElement = null;
     
-    // Try different selectors to find listing elements
-    for (const selector of selectors) {
-      const elements = document.querySelectorAll(selector);
-      if (elements && elements.length > 0) {
-        items = elements;
+    // Find the first valid scrollable element
+    for (const selector of scrollableSelectors) {
+      const element = document.querySelector(selector);
+      if (element && element.scrollHeight > element.clientHeight) {
+        scrollableElement = element;
         break;
       }
     }
     
-    for (let i = 0; i < Math.min(items.length, maxResults); i++) {
-      try {
-        const item = items[i];
-        
-        // Try different approaches to get the business name
-        let name = null;
-        
-        // Approach 1: aria-label attribute
-        if (!name && item.getAttribute('aria-label')) {
-          name = item.getAttribute('aria-label');
-        }
-        
-        // Approach 2: Look for heading elements
-        if (!name) {
-          const heading = item.querySelector('h3, h2, h1, div[role="heading"]');
-          if (heading) {
-            name = heading.textContent.trim();
-          }
-        }
-        
-        // Approach 3: Look for any text content
-        if (!name) {
-          name = item.textContent.trim().split('\n')[0].trim();
-        }
-        
-        // Only add if we found a name
-        if (name) {
-          listings.push({ 
-            name,
-            index: i // Store the index for navigation purposes
-          });
-        }
-      } catch (err) {
-        console.error('Error extracting listing:', err);
-      }
+    // If no specific element found, try the document body
+    if (!scrollableElement) {
+      scrollableElement = document.scrollingElement || document.documentElement;
     }
     
-    return listings;
-  }, limit);
+    const scrollHeight = scrollableElement.scrollHeight;
+    const windowHeight = window.innerHeight || scrollableElement.clientHeight;
+    const scrollDistance = windowHeight * 0.7; // Scroll 70% of visible window
+    
+    // Starting position
+    const startY = scrollableElement.scrollTop;
+    const endY = Math.min(startY + scrollDistance, scrollHeight - windowHeight);
+    
+    // Smooth scroll in small steps
+    const steps = 15;
+    const stepSize = (endY - startY) / steps;
+    
+    for (let i = 1; i <= steps; i++) {
+      scrollableElement.scrollTop = startY + (stepSize * i);
+      // Small pause between each scroll step
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    
+    return true; // Return success
+  });
 }
 
 // Function to extract detailed business information with more reliable selectors
@@ -767,50 +684,6 @@ async function extractBusinessDetails(page) {
   });
 }
 
-// Helper function to scroll down and load more results
-async function autoScroll(page) {
-  await page.evaluate(async () => {
-    // Try different selectors for the feed
-    const feedSelectors = [
-      'div[role="feed"]',
-      'div.m6QErb[role="region"]',
-      'div.m6QErb',
-      'div.section-scrollbox',
-      'div.ecceSd'
-    ];
-    
-    let feed = null;
-    for (const selector of feedSelectors) {
-      const element = document.querySelector(selector);
-      if (element) {
-        feed = element;
-        break;
-      }
-    }
-    
-    if (!feed) return;
-    
-    await new Promise(resolve => {
-      let totalHeight = 0;
-      const distance = 300; // Increased scroll distance
-      const timer = setInterval(() => {
-        const scrollHeight = feed.scrollHeight;
-        feed.scrollBy(0, distance);
-        totalHeight += distance;
-        
-        // Resolve after a reasonable amount of scrolling
-        if (totalHeight >= scrollHeight || totalHeight > 6000) {
-          clearInterval(timer);
-          resolve();
-        }
-      }, 200); // Slightly slower scrolling for better loading
-    });
-  });
-  
-  // Wait for new elements to load
-  await page.waitForTimeout(3000);
-}
-
 // Export data to Excel
 async function exportToExcel(data) {
   const workbook = new ExcelJS.Workbook();
@@ -858,7 +731,7 @@ async function exportToExcel(data) {
 // Export data to CSV
 function exportToCSV(data) {
   try {
-    const fields = ['name', 'address', 'phone', 'website', 'email', 'rating', 'reviews', 'hours', 'category'];
+    const fields = ['name', 'address', 'phone', 'website', 'email', 'rating', 'reviews', 'hours', 'category', 'priceRange', 'attributes'];
     const parser = new Parser({ fields });
     return parser.parse(data);
   } catch (error) {
@@ -867,8 +740,13 @@ function exportToCSV(data) {
   }
 }
 
-// Start the server
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-  console.log(`Open http://localhost:${PORT} in your browser`);
-});
+// Add serverless function handler for Vercel
+module.exports = app;
+
+// Only start the server in development, not needed for Vercel deployment
+if (process.env.NODE_ENV !== 'production') {
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+    console.log(`Open http://localhost:${PORT} in your browser`);
+  });
+}
